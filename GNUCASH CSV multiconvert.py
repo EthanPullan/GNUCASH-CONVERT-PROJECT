@@ -1,45 +1,68 @@
 import csv
 import re
-from tkinter import Tk, filedialog
 import os
+import json
+from tkinter import Tk, filedialog
 from tabulate import tabulate
 from datetime import datetime
 
-# Default accounts
-DEFAULT_CASH_ACCOUNT = "Assets:Investments:FHSA's:WS Managed"
-DEFAULT_DIVIDEND_ACCOUNT = "Income:Dividend Income:FHSA"
-DEFAULT_FEE_ACCOUNT = "Expenses:Fees and Charges:Financial Charges (Investing)"
-DEFAULT_CONTRIBUTION_ACCOUNT = "Imbalance-CAD"
+def load_config(config_path="config.json"):
+    if not os.path.exists(config_path):
+        print(f"⚠️ Config file '{config_path}' not found. Using internal defaults.")
+        return {}
+    with open(config_path, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            print(f"❌ Failed to parse config file '{config_path}'.")
+            return {}
+
+# Load defaults from config
+config = load_config()
+
+DEFAULT_CASH_ACCOUNT = config.get("cash_account", "Assets:Investments:FHSA's:WS Managed")
+DEFAULT_DIVIDEND_ACCOUNT = config.get("dividend_account", "Income:Dividend Income:FHSA")
+DEFAULT_FEE_ACCOUNT = config.get("fee_account", "Expenses:Fees and Charges:Financial Charges (Investing)")
+DEFAULT_CONTRIBUTION_ACCOUNT = config.get("contribution_account", "Imbalance-CAD")
 
 def parse_transaction(row, cash_account, dividend_account, fee_account, all_dates):
     date, ttype, desc, amount = row[:4]
-    amount = float(amount)
+
+    try:
+        amount = float(amount)
+    except (ValueError, TypeError):
+        print(f"⚠️ Skipping transaction with invalid or missing amount: {row}")
+        return []
+    if amount == 0:
+        print(f"⚠️ Skipping {ttype} transaction with $0 amount: {row}")
+        return []
+
     all_dates.append(date)
     entries = []
 
-    # Extract full symbol (e.g., KILO.B, ZAG.U)
+    # Extract and normalize symbol
     symbol_match = re.match(r"([\w\.\-]+) -", desc)
     raw_symbol = symbol_match.group(1) if symbol_match else "UNKNOWN"
-    symbol = re.split(r"[.\-]", raw_symbol)[0]  # Normalize (e.g. KILO.B → KILO)
+    symbol = re.split(r"[.\-]", raw_symbol)[0]
     stock_account = f"{cash_account}:{symbol}"
 
     if ttype == "DIV":
-        entries.append([date, f"Dividend {symbol}", dividend_account, "", "", -amount, ttype])
-        entries.append([date, f"Dividend {symbol}", cash_account, "", "", amount, ttype])
+        entries.append([date, f"Dividend {symbol}", dividend_account, "", "", -amount, "DIV"])   # Credit income
+        entries.append([date, f"Dividend {symbol}", cash_account, "", "", amount, "CASH"])       # Debit cash
+        entries.append([date, f"Dividend {symbol}", stock_account, "", "", 0.00, "STOCK"])       # $0 entry in stock register
+
 
     elif ttype == "FEE":
         if amount < 0:
-            # Actual fee
-            entries.append([date, "Investment Fee", fee_account, "", "", abs(amount), ttype])
-            entries.append([date, "Investment Fee", cash_account, "", "", -abs(amount), ttype])
+            entries.append([date, "Investment Fee", fee_account, "", "", abs(amount), "FEE"])
+            entries.append([date, "Investment Fee", cash_account, "", "", -abs(amount), "CASH"])
         else:
-            # Rebate (positive value)
-            entries.append([date, "Fee Rebate", cash_account, "", "", abs(amount), ttype])
-            entries.append([date, "Fee Rebate", fee_account, "", "", -abs(amount), ttype])
+            entries.append([date, "Fee Rebate", cash_account, "", "", abs(amount), "CASH"])
+            entries.append([date, "Fee Rebate", fee_account, "", "", -abs(amount), "FEE"])
 
     elif ttype == "CONT":
-        entries.append([date, "Contribution", cash_account, "", "", abs(amount), ttype])
-        entries.append([date, "Contribution", DEFAULT_CONTRIBUTION_ACCOUNT, "", "", -abs(amount), ttype])
+        entries.append([date, "Contribution", cash_account, "", "", abs(amount), "CASH"])
+        entries.append([date, "Contribution", DEFAULT_CONTRIBUTION_ACCOUNT, "", "", -abs(amount), "CONT"])
 
     elif ttype in ["BUY", "SELL"]:
         share_match = re.search(r"([\d.]+) shares", desc)
@@ -48,16 +71,19 @@ def parse_transaction(row, cash_account, dividend_account, fee_account, all_date
         price = abs(amount) / abs(shares) if shares else 0.0
 
         entries.append([date, f"{ttype} {symbol}", stock_account, shares, round(price, 4), abs(amount), ttype])
-        entries.append([date, f"{ttype} {symbol}", cash_account, "", "", amount, ttype])
+
+        cash_amount = -abs(amount) if ttype == "BUY" else abs(amount)
+        entries.append([date, f"{ttype} {symbol}", cash_account, "", "", cash_amount, "CASH"])
 
     else:
-        print(f"⚠️ Warning: Unhandled transaction type '{ttype}' on row: {row}")
-        
+        print(f"⚠️ Unhandled transaction type '{ttype}' on row: {row}")
+
     return entries
 
 def convert_multiple_csvs(input_files, output_dir, cash_account, dividend_account, fee_account):
     all_entries = []
     all_dates = []
+    txn_counter_per_date = {}
 
     for file in input_files:
         with open(file, newline='') as csvfile:
@@ -65,10 +91,18 @@ def convert_multiple_csvs(input_files, output_dir, cash_account, dividend_accoun
             next(reader)  # Skip header
             for row in reader:
                 if len(row) < 4:
-                    print(f"Skipping malformed row in {file}: {row}")
+                    print(f"⚠️ Skipping malformed row in {file}: {row}")
                     continue
                 try:
-                    all_entries.extend(parse_transaction(row[:4], cash_account, dividend_account, fee_account, all_dates))
+                    txn_entries = parse_transaction(row[:4], cash_account, dividend_account, fee_account, all_dates)
+                    if txn_entries:
+                        date = txn_entries[0][0]
+                        txn_counter_per_date.setdefault(date, 0)
+                        txn_counter_per_date[date] += 1
+                        txn_id = f"TRX-{date}-{txn_counter_per_date[date]:03d}"
+
+                        for entry in txn_entries:
+                            all_entries.append(entry + [txn_id])
                 except Exception as e:
                     print(f"❌ Error in {file} on row: {row}\n{e}")
 
@@ -76,23 +110,20 @@ def convert_multiple_csvs(input_files, output_dir, cash_account, dividend_accoun
         print("❌ No transactions found.")
         return
 
-    # Sort and determine date range
-    all_entries.sort(key=lambda x: x[0])
+    all_entries.sort(key=lambda x: x[0])  # Sort by date
     all_dates.sort()
     start_date = datetime.strptime(all_dates[0], "%Y-%m-%d").date()
     end_date = datetime.strptime(all_dates[-1], "%Y-%m-%d").date()
     output_filename = f"gnucash_{start_date}_to_{end_date}.csv"
     output_path = os.path.join(output_dir, output_filename)
 
-    # Save output CSV
     with open(output_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["Date", "Description", "Account", "Num.Shares", "Price", "Amount", "Type"])
+        writer.writerow(["Date", "Description", "Account", "Num.Shares", "Price", "Amount", "Type", "Transaction ID"])
         writer.writerows(all_entries)
 
-    # Print to console
     print("\nConverted Transactions:")
-    print(tabulate(all_entries, headers=["Date", "Description", "Account", "Num.Shares", "Price", "Amount", "Type"], tablefmt="grid"))
+    print(tabulate(all_entries, headers=["Date", "Description", "Account", "Num.Shares", "Price", "Amount", "Type", "Transaction ID"], tablefmt="grid"))
     print(f"\n✅ Saved to:\n{output_path}")
 
 def main():

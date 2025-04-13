@@ -1,0 +1,6 @@
+{
+  "cash_account": "Assets:Investments:Wealthsimple RRSP",
+  "dividend_account": "Income:Dividend Income:RRSP",
+  "fee_account": "Expenses:Fees and Charges:Financial Charges (Investing)",
+  "contribution_account": "Imbalance-CAD"
+}
